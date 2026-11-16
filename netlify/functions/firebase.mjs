@@ -1,141 +1,325 @@
 import crypto from "node:crypto";
 import { initializeApp, getApps, cert } from "firebase-admin/app";
-import { getFirestore, FieldPath } from "firebase-admin/firestore";
+import { getFirestore } from "firebase-admin/firestore";
 import { getDatabase } from "firebase-admin/database";
 import { getAuth } from "firebase-admin/auth";
 import { getStorage } from "firebase-admin/storage";
 
-const json = (statusCode, body) => ({
-  statusCode,
-  headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" },
-  body: JSON.stringify(body),
-});
-const safeEqual = (a, b) => {
-  const x = Buffer.from(String(a || ""));
-  const y = Buffer.from(String(b || ""));
-  return x.length === y.length && crypto.timingSafeEqual(x, y);
-};
-const cleanPath = (value) => {
-  if (typeof value !== "string" || !value.trim() || value.length > 500 || value.includes("..")) {
-    throw new Error("Invalid path");
+const MAX_BODY_BYTES = 1_000_000;
+const MAX_PATH_LENGTH = 500;
+
+class HttpError extends Error {
+  constructor(status, message) {
+    super(message);
+    this.status = status;
   }
-  return value.replace(/^\/+|\/+$/g, "");
-};
+}
+
+const json = (status, body) =>
+  new Response(JSON.stringify(body), {
+    status,
+    headers: {
+      "content-type": "application/json; charset=utf-8",
+      "cache-control": "no-store",
+      "x-content-type-options": "nosniff",
+    },
+  });
+
+function env(name) {
+  return globalThis.Netlify?.env?.get?.(name) ?? process.env[name];
+}
+
+function safeEqual(left, right) {
+  const a = Buffer.from(String(left || ""));
+  const b = Buffer.from(String(right || ""));
+  return a.length === b.length && a.length > 0 && crypto.timingSafeEqual(a, b);
+}
+
+function isRecord(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function requiredString(value, name, maxLength = MAX_PATH_LENGTH) {
+  if (typeof value !== "string" || !value.trim() || value.length > maxLength) {
+    throw new HttpError(400, "Invalid " + name);
+  }
+  return value.trim();
+}
+
+function cleanPath(value, options = {}) {
+  const allowRoot = options.allowRoot === true;
+  if (typeof value !== "string" || value.length > MAX_PATH_LENGTH) {
+    throw new HttpError(400, "Invalid path");
+  }
+
+  const trimmed = value.trim();
+  if (allowRoot && (trimmed === "" || trimmed === "/")) return "/";
+
+  const normalized = trimmed.replace(/^\/+|\/+$/g, "");
+  if (!normalized) throw new HttpError(400, "Invalid path");
+
+  const segments = normalized.split("/");
+  if (segments.some((part) => !part || part === "." || part === ".." || part.includes("\0"))) {
+    throw new HttpError(400, "Invalid path");
+  }
+  return normalized;
+}
+
+function firestorePath(value, kind) {
+  const path = cleanPath(value);
+  const count = path.split("/").length;
+  const shouldBeDocument = kind === "document";
+  if ((shouldBeDocument && count % 2 !== 0) || (!shouldBeDocument && count % 2 !== 1)) {
+    throw new HttpError(400, "Invalid Firestore " + kind + " path");
+  }
+  return path;
+}
+
+function boundedLimit(value, fallback, maximum) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
+  return Math.min(Math.floor(parsed), maximum);
+}
+
 function firebase() {
-  const projectId = process.env.FIREBASE_PROJECT_ID;
-  const raw = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
-  if (!projectId || !raw) throw new Error("Firebase environment variables are not configured");
+  const projectId = env("FIREBASE_PROJECT_ID");
+  const raw = env("FIREBASE_SERVICE_ACCOUNT_JSON");
+
+  if (!projectId || !raw) {
+    throw new HttpError(503, "Firebase service is not configured");
+  }
+
   let serviceAccount;
-  try { serviceAccount = JSON.parse(raw); } catch { throw new Error("FIREBASE_SERVICE_ACCOUNT_JSON must contain valid JSON"); }
-  if (serviceAccount.project_id !== projectId) throw new Error("Service account project_id does not match FIREBASE_PROJECT_ID");
-  const app = getApps()[0] || initializeApp({
+  try {
+    serviceAccount = JSON.parse(raw);
+  } catch {
+    throw new HttpError(503, "Firebase service configuration is invalid");
+  }
+
+  if (!isRecord(serviceAccount) || serviceAccount.project_id !== projectId || !serviceAccount.private_key || !serviceAccount.client_email) {
+    throw new HttpError(503, "Firebase service configuration is invalid");
+  }
+
+  const existing = getApps().find((item) => item.name === "[DEFAULT]");
+  if (existing) return existing;
+
+  return initializeApp({
     credential: cert(serviceAccount),
     projectId,
-    databaseURL: process.env.FIREBASE_DATABASE_URL || undefined,
-    storageBucket: process.env.FIREBASE_STORAGE_BUCKET || undefined,
+    databaseURL: env("FIREBASE_DATABASE_URL") || undefined,
+    storageBucket: env("FIREBASE_STORAGE_BUCKET") || undefined,
   });
-  return app;
 }
-const needsDeleteConfirm = (body) => body.confirm === "DELETE";
 
-export default async (req) => {
-  if (req.httpMethod === "OPTIONS") return { statusCode: 204, headers: { "cache-control": "no-store" }, body: "" };
-  if (req.httpMethod !== "POST") return json(405, { error: "Use POST" });
+function requireDeleteConfirmation(body) {
+  if (body.confirm !== "DELETE") {
+    throw new HttpError(400, 'Send confirm: "DELETE" to confirm deletion');
+  }
+}
 
-  const expected = process.env.ADMIN_API_TOKEN;
-  const authHeader = req.headers.authorization || "";
-  const supplied = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : "";
-  if (!expected || !safeEqual(supplied, expected)) return json(401, { error: "Unauthorized" });
+export default async function handler(request) {
+  if (request.method !== "POST") {
+    return json(405, { error: "Use POST" });
+  }
+
+  const expectedToken = env("ADMIN_API_TOKEN");
+  const authorization = request.headers.get("authorization") || "";
+  const suppliedToken = authorization.startsWith("Bearer ")
+    ? authorization.slice(7)
+    : "";
+
+  if (typeof expectedToken !== "string" || expectedToken.length < 32 || !safeEqual(suppliedToken, expectedToken)) {
+    return json(401, { error: "Unauthorized" });
+  }
+
+  let rawBody;
+  try {
+    const contentLength = Number(request.headers.get("content-length") || 0);
+    if (contentLength > MAX_BODY_BYTES) return json(413, { error: "Request too large" });
+
+    rawBody = await request.text();
+    if (Buffer.byteLength(rawBody, "utf8") > MAX_BODY_BYTES) {
+      return json(413, { error: "Request too large" });
+    }
+  } catch {
+    return json(400, { error: "Could not read request body" });
+  }
 
   let body;
   try {
-    if ((req.body || "").length > 1_000_000) return json(413, { error: "Request too large" });
-    body = JSON.parse(req.body || "{}");
-  } catch { return json(400, { error: "Invalid JSON body" }); }
+    body = JSON.parse(rawBody || "{}");
+  } catch {
+    return json(400, { error: "Invalid JSON body" });
+  }
+
+  if (!isRecord(body) || typeof body.operation !== "string") {
+    return json(400, { error: "A valid operation is required" });
+  }
 
   try {
     const app = firebase();
-    const op = body.operation;
-    if (op === "health") return json(200, { ok: true, projectId: process.env.FIREBASE_PROJECT_ID });
+    const operation = body.operation;
 
-    if (op.startsWith("firestore.")) {
+    if (operation === "health") {
+      return json(200, { ok: true, projectId: env("FIREBASE_PROJECT_ID") });
+    }
+
+    if (operation.startsWith("firestore.")) {
       const db = getFirestore(app);
-      if (op === "firestore.get") {
-        const snap = await db.doc(cleanPath(body.path)).get();
-        return json(200, { exists: snap.exists, data: snap.exists ? snap.data() : null });
+
+      if (operation === "firestore.get") {
+        const path = firestorePath(body.path, "document");
+        const snapshot = await db.doc(path).get();
+        return json(200, {
+          exists: snapshot.exists,
+          data: snapshot.exists ? snapshot.data() : null,
+        });
       }
-      if (op === "firestore.list") {
-        const snap = await db.collection(cleanPath(body.path)).limit(Math.min(Number(body.limit) || 50, 100)).get();
-        return json(200, { documents: snap.docs.map(d => ({ id: d.id, data: d.data() })) });
+
+      if (operation === "firestore.list") {
+        const path = firestorePath(body.path, "collection");
+        const snapshot = await db.collection(path)
+          .limit(boundedLimit(body.limit, 50, 100))
+          .get();
+        return json(200, {
+          documents: snapshot.docs.map((doc) => ({ id: doc.id, data: doc.data() })),
+        });
       }
-      if (op === "firestore.set" || op === "firestore.update") {
-        if (!body.data || typeof body.data !== "object" || Array.isArray(body.data)) return json(400, { error: "data must be an object" });
-        const ref = db.doc(cleanPath(body.path));
-        if (op === "firestore.set") await ref.set(body.data, { merge: body.merge === true });
-        else await ref.update(body.data);
+
+      if (operation === "firestore.set" || operation === "firestore.update") {
+        const path = firestorePath(body.path, "document");
+        if (!isRecord(body.data)) throw new HttpError(400, "data must be an object");
+
+        const reference = db.doc(path);
+        if (operation === "firestore.set") {
+          await reference.set(body.data, { merge: body.merge === true });
+        } else {
+          await reference.update(body.data);
+        }
         return json(200, { ok: true });
       }
-      if (op === "firestore.delete") {
-        if (!needsDeleteConfirm(body)) return json(400, { error: 'Send confirm: "DELETE" to confirm deletion' });
-        await db.doc(cleanPath(body.path)).delete();
+
+      if (operation === "firestore.delete") {
+        const path = firestorePath(body.path, "document");
+        requireDeleteConfirmation(body);
+        await db.doc(path).delete();
         return json(200, { ok: true });
       }
+
+      throw new HttpError(400, "Unsupported operation");
     }
 
-    if (op.startsWith("rtdb.")) {
-      const db = getDatabase(app);
-      const ref = db.ref(cleanPath(body.path || "/"));
-      if (op === "rtdb.get") return json(200, { value: (await ref.get()).val() });
-      if (op === "rtdb.set" || op === "rtdb.update") {
-        if (op === "rtdb.set") await ref.set(body.data);
-        else await ref.update(body.data);
+    if (operation.startsWith("rtdb.")) {
+      const path = cleanPath(body.path === undefined ? "/" : body.path, { allowRoot: true });
+      const reference = getDatabase(app).ref(path);
+
+      if (operation === "rtdb.get") {
+        return json(200, { value: (await reference.get()).val() });
+      }
+
+      if (operation === "rtdb.set") {
+        if (!Object.hasOwn(body, "data")) throw new HttpError(400, "data is required");
+        await reference.set(body.data);
         return json(200, { ok: true });
       }
-      if (op === "rtdb.delete") {
-        if (!needsDeleteConfirm(body)) return json(400, { error: 'Send confirm: "DELETE" to confirm deletion' });
-        await ref.remove();
+
+      if (operation === "rtdb.update") {
+        if (!isRecord(body.data)) throw new HttpError(400, "data must be an object");
+        await reference.update(body.data);
         return json(200, { ok: true });
       }
+
+      if (operation === "rtdb.delete") {
+        requireDeleteConfirmation(body);
+        await reference.remove();
+        return json(200, { ok: true });
+      }
+
+      throw new HttpError(400, "Unsupported operation");
     }
 
-    if (op.startsWith("auth.")) {
+    if (operation.startsWith("auth.")) {
       const auth = getAuth(app);
-      if (op === "auth.list") {
-        const result = await auth.listUsers(Math.min(Number(body.limit) || 100, 1000), body.pageToken);
-        return json(200, { users: result.users.map(u => ({ uid:u.uid,email:u.email,displayName:u.displayName,disabled:u.disabled,emailVerified:u.emailVerified })), pageToken: result.pageToken || null });
+
+      if (operation === "auth.list") {
+        const result = await auth.listUsers(
+          boundedLimit(body.limit, 100, 1000),
+          typeof body.pageToken === "string" ? body.pageToken : undefined
+        );
+        return json(200, {
+          users: result.users.map((user) => ({
+            uid: user.uid,
+            email: user.email,
+            displayName: user.displayName,
+            disabled: user.disabled,
+            emailVerified: user.emailVerified,
+          })),
+          pageToken: result.pageToken || null,
+        });
       }
-      if (op === "auth.create") {
-        const user = await auth.createUser({ email:body.email, password:body.password, displayName:body.displayName, disabled:body.disabled === true });
-        return json(201, { uid:user.uid, email:user.email });
+
+      if (operation === "auth.create") {
+        const email = requiredString(body.email, "email", 320);
+        const password = requiredString(body.password, "password", 128);
+        const user = await auth.createUser({
+          email,
+          password,
+          displayName: typeof body.displayName === "string" ? body.displayName.slice(0, 256) : undefined,
+          disabled: body.disabled === true,
+        });
+        return json(201, { uid: user.uid, email: user.email });
       }
-      if (op === "auth.disable" || op === "auth.enable") {
-        await auth.updateUser(body.uid, { disabled: op === "auth.disable" });
+
+      if (operation === "auth.enable" || operation === "auth.disable") {
+        const uid = requiredString(body.uid, "uid", 128);
+        await auth.updateUser(uid, { disabled: operation === "auth.disable" });
         return json(200, { ok: true });
       }
-      if (op === "auth.delete") {
-        if (!needsDeleteConfirm(body)) return json(400, { error: 'Send confirm: "DELETE" to confirm deletion' });
-        await auth.deleteUser(body.uid);
+
+      if (operation === "auth.delete") {
+        const uid = requiredString(body.uid, "uid", 128);
+        requireDeleteConfirmation(body);
+        await auth.deleteUser(uid);
         return json(200, { ok: true });
       }
+
+      throw new HttpError(400, "Unsupported operation");
     }
 
-    if (op.startsWith("storage.")) {
+    if (operation.startsWith("storage.")) {
       const bucket = getStorage(app).bucket();
-      if (op === "storage.list") {
-        const [files] = await bucket.getFiles({ prefix: body.prefix || "", maxResults: Math.min(Number(body.limit) || 100, 500) });
-        return json(200, { files: files.map(f => ({ name:f.name, size:f.metadata.size, contentType:f.metadata.contentType })) });
+
+      if (operation === "storage.list") {
+        const prefix = body.prefix === undefined ? "" : requiredString(body.prefix, "prefix", MAX_PATH_LENGTH);
+        const [files] = await bucket.getFiles({
+          prefix,
+          maxResults: boundedLimit(body.limit, 100, 500),
+        });
+        return json(200, {
+          files: files.map((file) => ({
+            name: file.name,
+            size: file.metadata.size,
+            contentType: file.metadata.contentType,
+          })),
+        });
       }
-      if (op === "storage.delete") {
-        if (!needsDeleteConfirm(body)) return json(400, { error: 'Send confirm: "DELETE" to confirm deletion' });
-        await bucket.file(cleanPath(body.path)).delete();
+
+      if (operation === "storage.delete") {
+        const path = cleanPath(body.path);
+        requireDeleteConfirmation(body);
+        await bucket.file(path).delete();
         return json(200, { ok: true });
       }
+
+      throw new HttpError(400, "Unsupported operation");
     }
 
-    return json(400, { error: "Unsupported operation" });
+    throw new HttpError(400, "Unsupported operation");
   } catch (error) {
-    const message = error?.message || "Internal error";
-    const status = /Invalid path|data must|confirm:|Unsupported operation/.test(message) ? 400 : 500;
-    return json(status, { error: message });
+    if (error instanceof HttpError) {
+      return json(error.status, { error: error.message });
+    }
+    // Keep Firebase and infrastructure details out of public API responses.
+    return json(500, { error: "The requested operation failed" });
   }
-};
+}
