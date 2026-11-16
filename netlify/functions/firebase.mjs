@@ -46,6 +46,14 @@ function requiredString(value, name, maxLength = MAX_PATH_LENGTH) {
   return value.trim();
 }
 
+function requiredPassword(value) {
+  // Preserve intentional leading/trailing spaces in passwords.
+  if (typeof value !== "string" || value.length < 6 || value.length > 128 || !value.trim()) {
+    throw new HttpError(400, "Password must be 6 to 128 characters");
+  }
+  return value;
+}
+
 function cleanPath(value, options = {}) {
   const allowRoot = options.allowRoot === true;
   if (typeof value !== "string" || value.length > MAX_PATH_LENGTH) {
@@ -260,7 +268,7 @@ export default async function handler(request) {
 
       if (operation === "auth.create") {
         const email = requiredString(body.email, "email", 320);
-        const password = requiredString(body.password, "password", 128);
+        const password = requiredPassword(body.password);
         const user = await auth.createUser({
           email,
           password,
